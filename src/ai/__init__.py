@@ -5,11 +5,28 @@ structured response models, and domain action functions.
 """
 
 from src.ai.harness import (
+    DEFAULT_MODELS_CASCADE,
+    DEFAULT_SYSTEM_INSTRUCTION,
+    DEFAULT_TRANSCRIBER_SYSTEM_INSTRUCTION,
     GenAIHarness,
     HarnessResult,
     get_ai_harness,
-    DEFAULT_MODELS_CASCADE,
-    DEFAULT_SYSTEM_INSTRUCTION,
+    parse_clarification_from_reply,
+)
+from src.ai.memory import (
+    GroupMessageTurn,
+    HierarchicalMemoryManager,
+    UserSessionMemory,
+    UserState,
+    add_draft_record,
+    format_draft_summary,
+    get_active_draft_memory,
+    get_draft_records,
+    get_hierarchical_memory_manager,
+    remove_draft_record,
+    set_active_draft_memory,
+    to_base_records,
+    update_draft_record,
 )
 from src.ai.response import (
     PendingEvents,
@@ -71,7 +88,22 @@ __all__ = [
     "get_ai_harness",
     "DEFAULT_MODELS_CASCADE",
     "DEFAULT_SYSTEM_INSTRUCTION",
-    # Response models
+    "DEFAULT_TRANSCRIBER_SYSTEM_INSTRUCTION",
+    "parse_clarification_from_reply",
+    # Memory
+    "HierarchicalMemoryManager",
+    "UserSessionMemory",
+    "UserState",
+    "GroupMessageTurn",
+    "get_hierarchical_memory_manager",
+    "add_draft_record",
+    "update_draft_record",
+    "remove_draft_record",
+    "get_draft_records",
+    "to_base_records",
+    "format_draft_summary",
+    "get_active_draft_memory",
+    "set_active_draft_memory",
     "PendingEvents",
     "AIResponse",
     "VoiceAIResponse",

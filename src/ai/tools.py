@@ -1456,12 +1456,79 @@ SEARCH_RUNNING_TASK_TOOL: Dict[str, Any] = {
     },
 }
 
+# ==============================================================================
+# DRAFT MEMORY MANAGEMENT TOOLS
+# ==============================================================================
+
+UPDATE_DRAFT_RECORD_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "name": "update_draft_record",
+    "description": (
+        "Chỉnh sửa hoặc bổ sung thông tin vào một bản ghi nghiệp vụ đã có trong danh sách đang tổng hợp (Draft Memory).\n"
+        "[TRIGGER CONDITION / KHI NÀO DÙNG]:\n"
+        "- Dùng khi người dùng bổ sung thông tin (ví dụ: bổ sung số lượng, đơn vị, tên vật tư, khu vực, ghi chú) cho bản ghi ở lượt trước.\n"
+        "- Ví dụ: Lượt 1 đã tạo #1 [ProductionLog] 'Cho gà ăn', lượt 2 người dùng nói 'cho ăn 2kg thức ăn' -> gọi update_draft_record(record_id=1, updates={'quantity': 2.0, 'unit': 'kg', 'material_name': 'Thức ăn', 'description': 'Cho gà ăn 2kg thức ăn'})."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "record_id": {
+                "type": "integer",
+                "description": "Mã số thứ tự của bản ghi trong bộ nhớ draft (#1, #2...).",
+            },
+            "updates": {
+                "type": "object",
+                "description": "Từ điển chứa các trường và giá trị cần cập nhật/bổ sung (ví dụ: {'quantity': 2.0, 'unit': 'kg', 'material_name': 'Thức ăn'}).",
+            },
+        },
+        "required": ["record_id", "updates"],
+    },
+}
+
+REMOVE_DRAFT_RECORD_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "name": "remove_draft_record",
+    "description": (
+        "Xóa bỏ một bản ghi khỏi danh sách đang tổng hợp trong bộ nhớ (Draft Memory).\n"
+        "[TRIGGER CONDITION / KHI NÀO DÙNG]:\n"
+        "- Dùng khi người dùng yêu cầu hủy, đính chính không làm nữa, hoặc bản ghi bị trùng lặp/sai sót."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "record_id": {
+                "type": "integer",
+                "description": "Mã số thứ tự của bản ghi cần xóa (#1, #2...).",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Lý do xóa bỏ.",
+            },
+        },
+        "required": ["record_id"],
+    },
+}
+
+GET_DRAFT_RECORDS_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "name": "get_draft_records",
+    "description": "Xem danh sách toàn bộ các bản ghi nghiệp vụ hiện đang tổng hợp trong bộ nhớ (Draft Memory).",
+    "parameters": {
+        "type": "object",
+        "properties": {},
+    },
+}
+
 
 # ==============================================================================
 # ALL REGISTERED TOOLS
 # ==============================================================================
 
 ALL_TOOLS: List[Dict[str, Any]] = [
+    # Working Memory tools
+    UPDATE_DRAFT_RECORD_TOOL,
+    REMOVE_DRAFT_RECORD_TOOL,
+    GET_DRAFT_RECORDS_TOOL,
     # Creation and Operation tools
     CREATE_NEW_ZONE_TOOL,
     CREATE_TASK_TOOL,
@@ -1496,8 +1563,6 @@ ALL_TOOLS: List[Dict[str, Any]] = [
     SEARCH_DEBT_RECORD_TOOL,
     SEARCH_COLLABORATOR_TOOL,
 ]
-
-
 def dict_to_function_declaration(tool_dict: Dict[str, Any]) -> types.FunctionDeclaration:
     """Converts OpenAI tool dict into Google GenAI FunctionDeclaration."""
     d = tool_dict.get("function", tool_dict)

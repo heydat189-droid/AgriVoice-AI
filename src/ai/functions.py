@@ -1725,7 +1725,26 @@ AVAILABLE_FUNCTIONS: Dict[str, Callable[..., Any]] = {
     "search_running_tasks": search_running_task,
     "search_dictionary": search_dictionary,
     "search_dictionaries": search_dictionary,
+    # In-memory working draft tools
+    "update_draft_record": lambda record_id, updates, **kw: _update_draft_wrapper(record_id, updates),
+    "remove_draft_record": lambda record_id, reason=None, **kw: _remove_draft_wrapper(record_id, reason),
+    "get_draft_records": lambda **kw: _get_drafts_wrapper(),
 }
+
+
+def _update_draft_wrapper(record_id: int, updates: Dict[str, Any]) -> Dict[str, Any]:
+    from src.ai.memory import update_draft_record
+    return update_draft_record(record_id=record_id, updates=updates)
+
+
+def _remove_draft_wrapper(record_id: int, reason: Optional[str] = None) -> Dict[str, Any]:
+    from src.ai.memory import remove_draft_record
+    return remove_draft_record(record_id=record_id, reason=reason)
+
+
+def _get_drafts_wrapper() -> List[Dict[str, Any]]:
+    from src.ai.memory import get_draft_records
+    return get_draft_records()
 
 
 def execute_function(func_name: str, arguments: Dict[str, Any]) -> Any:
@@ -1735,4 +1754,12 @@ def execute_function(func_name: str, arguments: Dict[str, Any]) -> Any:
         raise ValueError(
             f"Function '{func_name}' is not registered in AVAILABLE_FUNCTIONS."
         )
-    return func(**arguments)
+    result = func(**arguments)
+    if isinstance(result, BaseRecord):
+        from src.ai.memory import add_draft_record
+        add_draft_record(
+            record_type=result.__class__.__name__,
+            data=result.to_record(exclude_none=True),
+            record=result,
+        )
+    return result

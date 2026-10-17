@@ -157,5 +157,37 @@ def test_tool_not_called():
     # Output: "The capital of France is Paris."
     print("Model Output:", interaction.output_text)
 
+def test_stateless_multiconversation():
+    history = [
+        {
+            "type": "user_input",
+            "content": [{"type": "text", "text": "I have 2 dogs in my house."}]
+        }
+    ]
+
+    interaction1 = client.interactions.create(
+        model="gemini-3.8-flash",
+        store=False,
+        input=history
+    )
+    print("Response 1:", interaction1.steps[-1].content[0].text)
+
+    for step in interaction1.steps:
+        x = step.model_dump()
+        print("X:", x)
+        history.append(x)
+
+    history.append({
+        "type": "user_input",
+        "content": [{"type": "text", "text": "How many paws are in my house?"}]
+    })
+
+    interaction2 = client.interactions.create(
+        model="gemini-3.8-flash",
+        store=False,
+        input=history
+    )
+    print("Response 2:", interaction2.steps[-1].content[0].text)
+
 if __name__ == "__main__":
-    test_tool_not_called()
+    test_stateless_multiconversation()

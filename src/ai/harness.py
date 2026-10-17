@@ -34,12 +34,21 @@ from google.genai import types
 from google.genai.errors import APIError
 
 from src.ai.functions import AVAILABLE_FUNCTIONS, execute_function
+from src.ai.memory import (
+    HierarchicalMemoryManager,
+    UserSessionMemory,
+    UserState,
+    format_draft_summary,
+    get_active_draft_memory,
+    get_hierarchical_memory_manager,
+    set_active_draft_memory,
+    to_base_records,
+)
 from src.ai.response import PendingEvents
 from src.ai.tools import ALL_TOOLS, get_genai_tools
 from src.db.connection import get_db, get_db_path
 from src.db.models import BaseRecord
 from src.db.pending_service import stage_voice_event
-
 logger = logging.getLogger("agrivoice.ai.harness")
 
 
@@ -51,45 +60,74 @@ logger = logging.getLogger("agrivoice.ai.harness")
 DEFAULT_MODELS_CASCADE: List[str] = [
     "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash",
 ]
 
+DEFAULT_TRANSCRIBER_SYSTEM_INSTRUCTION = (
+    "Bạn là AI chuyên trách chuyển đổi âm thanh giọng nói nông dân sang văn bản (Agent 1: Speech-to-Text).\n"
+    "Nhiệm vụ duy nhất: Nghe file âm thanh và chép lại chính xác từng từ nguyên văn lời nói của người nông dân bằng tiếng Việt.\n"
+    "Lưu ý ngữ cảnh từ vựng nông trại: 'vừa cho gà ăn', 'tưới cây', 'cây chuối', 'bón phân', 'xịt thuốc', 'ghi lại giúp tôi', 'mùa vụ', 'khu A', 'thức ăn', 'kg'.\n"
+    "Quy tắc:\n"
+    "- Không thêm lời bình luận, không giải thích, không phán đoán, không định dạng markdown.\n"
+    "- Giữ nguyên các từ ngữ địa phương, tên cây trồng, vật nuôi, phân thuốc, số lượng, khu vực.\n"
+    "- Chỉ trả về duy nhất nội dung văn bản chép lại."
+)
+
+DEFAULT_USER_PROMPT = "Trích xuất toàn bộ nội dung khẩu lệnh trong âm thanh, thực thi đầy đủ các tool tương ứng (kho hàng, thu chi, sự cố, tác vụ) và phản hồi theo định dạng hệ thống kèm mục thông tin cần làm rõ nếu có."
+
 DEFAULT_SYSTEM_INSTRUCTION = (
-    "Bạn là hệ thống xử lý tác vụ nông nghiệp tự động AgriVoice-AI.\n"
-    "Nhiệm vụ: Phân tích khẩu lệnh thoại hoặc văn bản của nông trại, thực thi chính xác các hành động qua Tool Calling và phản hồi kết quả.\n"
+    "Bạn là hệ thống xử lý tác vụ nông nghiệp tự động AgriVoice-AI (Agent 2: Content Reasoning & Action Execution).\n"
+    "Nhiệm vụ: Phân tích khẩu lệnh văn bản nhận được từ Agent 1 (Speech-to-Text), quản lý danh sách bản ghi nghiệp vụ trong bộ nhớ (Draft Memory), thực thi đầy đủ các hành động qua Tool Calling và phản hồi kết quả.\n"
     "\n"
     "1. NGUYÊN TẮC GIAO TIẾP VÀ XƯNG HÔ (MÁY MÓC, TRỰC DIỆN):\n"
     "   - TUYỆT ĐỐI KHÔNG XƯNG HÔ (không dùng 'con', 'em', 'cháu', 'tôi', 'chú', 'bác', 'anh', 'chị').\n"
     "   - KHÔNG dùng từ ngữ giao tiếp xã giao, cảm xúc, thân mật (như 'dạ', 'ạ', 'nghen', 'nhé', 'xin chào', 'rất vui').\n"
     "   - Phản hồi ngắn gọn, chính xác, khách quan như log hệ thống máy móc.\n"
     "\n"
-    "2. QUY TẮC PHÂN LOẠI VÀ THỰC THI (TOOL CALLING):\n"
-    "   - NHẬT KÝ SẢN XUẤT / CÔNG VIỆC CHĂM SÓC HÀNG NGÀY:\n"
-    "     + Khi người dùng báo cáo công việc chăm sóc đã làm (cho ăn, tưới nước, bón phân, xịt thuốc, tỉa cành...): BẮT BUỘC dùng create_production_log (activity_type='FEEDING' khi cho ăn, 'IRRIGATION' khi tưới nước, 'FERTILIZING' khi bón phân, 'PEST_CONTROL' khi phun thuốc...). Tuyệt đối KHÔNG tạo issue cho các công việc chăm sóc bình thường này.\n"
-    "     + Nếu có tiêu hao vật tư (cám, phân bón, thuốc): đồng thời gọi create_inventory_transaction để xuất kho (transaction_type='ISSUE', quantity_change < 0, item_name).\n"
-    "   - MUA BÁN VẬT TƯ & THU CHI TÀI CHÍNH:\n"
-    "     + Khi mua vật tư: gọi create_inventory_transaction (nhập kho RECEIPT) VÀ create_financial_transaction (chi tiền EXPENSE).\n"
-    "   - SỰ CỐ, HỎNG HÓC & SỬA CHỮA ĐỘT XUẤT (ISSUE):\n"
-    "     + CHỈ dùng create_issue / manage_issue cho: hỏng hóc, sự cố máy móc, rò rỉ van nước, vỡ ống, sâu bệnh dịch hại, gia cố hàng rào đột xuất.\n"
-    "     + Nếu báo cáo đã sửa xong / khắc phục xong sự cố: kiểm tra search_issue / search_running_task trước; nếu không có thì gọi manage_issue hoặc create_issue với status='CLOSED' và resolution_notes.\n"
-    "   - BỔ SUNG THÔNG TIN ĐA LƯỢT (MULTI-TURN FOLLOW-UP):\n"
-    "     + Khi người dùng gửi thêm audio/tin nhắn bổ sung thông tin cho lượt trước (như số lượng cám, tên vụ mùa, đối tượng cụ thể...):\n"
-    "       * Kế thừa toàn bộ ngữ cảnh lượt trước, hoàn thiện các bản ghi còn thiếu (ví dụ: lượt 1 ghi cho ăn nhưng chưa có số lượng -> lượt 2 bổ sung 2kg thì tạo phiếu xuất kho 2kg và hoàn tất nhật ký).\n"
-    "       * Không tạo các bản ghi thừa mâu thuẫn hay lặp lại công việc đã ghi.\n"
-    "       * Khi thông tin bổ sung đã đầy đủ, mục 'Thông tin cần làm rõ' PHẢI BÁO: 'Không có.'\n"
-    "   - TRA CỨU & HỎI ĐÁP: Dùng search_dictionary, search_zone, search_inventory_transaction, search_financial_transaction... và trả lời trực tiếp.\n"
+    "2. QUẢN LÝ BỘ NHỚ BẢN GHI ĐANG TỔNG HỢP (DRAFT MEMORY TOOLS):\n"
+    "   - Trong bộ nhớ (Draft Memory) có thể đã lưu các bản ghi từ các lượt trước (ví dụ: #1 [ProductionLog] 'Cho gà ăn', #2 [ProductionLog] 'Tưới cây chuối khu A').\n"
+    "   - Khi người dùng BỔ SUNG THÔNG TIN cho bản ghi đã có:\n"
+    "     + BẮT BUỘC gọi `update_draft_record(record_id=..., updates={...})` để cập nhật bổ sung trường (như quantity, unit, material_name, description). TUYỆT ĐỐI KHÔNG xóa bỏ hay bỏ quên các bản ghi khác trong bộ nhớ.\n"
+    "   - Khi người dùng hủy bỏ hoặc đính chính sai sót: gọi `remove_draft_record(record_id=..., reason=...)`.\n"
+    "   - Muốn xem lại các bản ghi đang có trong bộ nhớ: gọi `get_draft_records()`.\n"
+    "   - Tạo mới các bản ghi mới phát sinh: dùng các công cụ `create_...`.\n"
     "\n"
-    "3. ĐỊNH DẠNG PHẢN HỒI BẮT BUỘC:\n"
-    "Phản hồi gồm 2 phần rõ ràng theo cấu trúc sau:\n"
+    "3. QUY TẮC PHÂN LOẠI NGHIỆP VỤ NÔNG TRẠI:\n"
+    "   - NHẬT KÝ SẢN XUẤT / BÁO CÔNG VIỆC ĐÃ LÀM:\n"
+    "     + Khi người dùng báo việc chăm sóc đã làm trong ngày (cho gà ăn, tưới nước cây chuối, bón phân, xịt thuốc, 'ghi lại giúp tôi'...): BẮT BUỘC dùng create_production_log. Tách riêng các hành động nếu có nhiều việc (ví dụ: một log cho ăn, một log tưới cây). TUYỆT ĐỐI KHÔNG tạo issue cho các công việc chăm sóc bình thường này.\n"
+    "   - XUẤT VẬT TƯ: Tiêu hao cám, thức ăn, phân bón, thuốc -> create_inventory_transaction (transaction_type='ISSUE', quantity_change < 0, item_name).\n"
+    "   - MUA VẬT TƯ: create_inventory_transaction (nhập kho RECEIPT) VÀ create_financial_transaction (chi tiền EXPENSE).\n"
+    "   - SỰ CỐ, HỎNG HÓC & VIỆC ĐỘT XUẤT (ISSUE): CHỈ dùng create_issue / manage_issue cho: van nứt, vỡ ống, hỏng máy bơm, sâu bệnh dịch hại, sửa chữa đột xuất.\n"
+    "   - KHỞI TẠO VỤ MÙA: Dùng create_production_cycle khi bắt đầu vụ mùa mới.\n"
+    "4. ĐỊNH DẠNG PHẢN HỒI BẮT BUỘC:\n"
     "Hệ thống ghi nhận:\n"
     "- [Loại hành động]: Chi tiết ngắn gọn (số lượng, đối tượng, khu vực, trạng thái).\n"
     "\n"
     "Thông tin cần làm rõ:\n"
-    "- Chỉ nêu thông tin thực sự trọng yếu còn thiếu (ví dụ: chưa rõ số lượng thức ăn tiêu hao, chưa rõ khu vực xảy ra sự cố).\n"
+    "- Chỉ nêu thông tin thực sự trọng yếu còn thiếu (ví dụ: chưa rõ số lượng thức ăn tiêu hao).\n"
     "- KHÔNG bắt bẻ về kho lưu trữ (hệ thống tự động liên kết kho mặc định).\n"
-    "- Nếu thông tin đã đầy đủ hoặc đã được bổ sung rõ ràng, GHI RÕ: 'Không có.'\n"
+    "- Nếu thông tin đã đầy đủ hoặc đã được bổ sung rõ ràng, GHI RÕ: 'Không có.'"
 )
+def parse_clarification_from_reply(reply_text: str) -> Tuple[bool, List[str]]:
+    """Analyzes reply text to determine if clarification is required and extracts items."""
+    lower_text = reply_text.lower()
+    marker = "thông tin cần làm rõ:"
+    if marker not in lower_text:
+        return False, []
+
+    idx = lower_text.find(marker)
+    clarification_section = reply_text[idx + len(marker) :].strip()
+
+    first_line = clarification_section.split("\n")[0].strip().lower()
+    if "không có" in first_line or clarification_section.lower().startswith("không có"):
+        return False, []
+
+    items = []
+    for line in clarification_section.split("\n"):
+        line = line.strip().lstrip("-•*").strip()
+        if line and not line.lower().startswith("không có"):
+            items.append(line)
+
+    return len(items) > 0, items
 
 
 @dataclass
@@ -108,6 +146,10 @@ class HarnessResult:
     execution_time_seconds: float = 0.0
     error: Optional[str] = None
     history: List[Any] = field(default_factory=list)
+    memory: Dict[str, Any] = field(default_factory=dict)
+    user_id: Optional[str] = None
+    clarification_needed: bool = False
+    clarification_items: List[str] = field(default_factory=list)
 
 
 class GenAIHarness:
@@ -118,6 +160,7 @@ class GenAIHarness:
         api_key: Optional[str] = None,
         models: Optional[List[str]] = None,
         system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION,
+        transcriber_instruction: str = DEFAULT_TRANSCRIBER_SYSTEM_INSTRUCTION,
         temperature: float = 0.1,
         max_retries: int = 4,
         base_delay: float = 2.0,
@@ -130,6 +173,7 @@ class GenAIHarness:
         self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         self.models_cascade = list(models) if models else list(DEFAULT_MODELS_CASCADE)
         self.system_instruction = system_instruction
+        self.transcriber_instruction = transcriber_instruction
         self.temperature = temperature
         self.max_retries = max_retries
         self.base_delay = base_delay
@@ -262,6 +306,39 @@ class GenAIHarness:
             raise ValueError("Audio data is empty.")
 
         return types.Part.from_bytes(data=data_bytes, mime_type=resolved_mime)
+    # --------------------------------------------------------------------------
+    # Agent 1: Speech-to-Text Transcriber
+    # --------------------------------------------------------------------------
+
+    def transcribe_voice(
+        self,
+        audio: Union[str, Path, bytes],
+    ) -> str:
+        """Agent 1: Dedicated speech-to-text agent converting farmer voice audio to text."""
+        audio_part = self.prepare_audio_part(audio)
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    audio_part,
+                    types.Part.from_text(text="Hãy chép lại chính xác từng từ trong đoạn ghi âm."),
+                ],
+            )
+        ]
+        config = types.GenerateContentConfig(
+            system_instruction=self.transcriber_instruction,
+            temperature=0.0,
+        )
+
+        def _call(model_name: str) -> Any:
+            return self.client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+
+        response, _ = self._call_with_resilience(_call, "transcribe_voice")
+        return (response.text or "").strip()
 
     # --------------------------------------------------------------------------
     # Agentic Tool Execution Loop
@@ -357,63 +434,59 @@ class GenAIHarness:
         audio: Union[str, Path, bytes],
         sender_id: str = "WORKER_1",
         audio_path_hint: Optional[str] = None,
-        user_prompt: str = "Trích xuất toàn bộ nội dung khẩu lệnh trong âm thanh, thực thi đầy đủ các tool tương ứng (kho hàng, thu chi, sự cố, tác vụ) và phản hồi theo định dạng hệ thống kèm mục thông tin cần làm rõ nếu có.",
+        user_prompt: str = DEFAULT_USER_PROMPT,
         db_path: Optional[Union[str, Path]] = None,
         auto_stage: bool = True,
         conversation_history: Optional[List[Any]] = None,
+        memory: Optional[Dict[str, Any]] = None,
+        user_id: Optional[Union[str, int]] = None,
+        full_name: str = "",
+        username: Optional[str] = None,
+        memory_manager: Optional[HierarchicalMemoryManager] = None,
     ) -> HarnessResult:
-        """End-to-end voice processing: converts audio, runs agentic loop, and auto-stages to In-Flight buffer."""
+        """End-to-end two-agent voice processing pipeline:
+        1. Agent 1 (Speech-to-Text): Transcribes audio to text verbatim.
+        2. Agent 2 (Reasoning & Action): Processes text, updates DraftMemory, and executes tools.
+        """
         start_time = time.time()
+        uid = str(user_id) if user_id is not None else sender_id
+        mgr = memory_manager
         try:
-            audio_part = self.prepare_audio_part(audio)
-            initial_parts = [
-                audio_part,
-                types.Part.from_text(text=user_prompt),
-            ]
-            contents = list(conversation_history) if conversation_history else []
-            contents.append(types.Content(role="user", parts=initial_parts))
+            # Step 1: Agent 1 (Speech-to-Text Transcriber)
+            if user_prompt and user_prompt not in (DEFAULT_USER_PROMPT, ""):
+                raw_transcript = user_prompt
+            else:
+                raw_transcript = self.transcribe_voice(audio)
 
-            final_text, records, model_used, steps = self.execute_agentic_loop(contents)
+            stored_audio_path = audio_path_hint or (str(audio) if isinstance(audio, (str, Path)) else None)
 
-            # Auto-stage records into pending_events if requested
-            staged_ids: List[int] = []
-            if auto_stage and records:
-                target_db = Path(db_path) if db_path else get_db_path()
-                stored_path = audio_path_hint or (str(audio) if isinstance(audio, (str, Path)) else None)
-
-                with get_db(target_db) as conn:
-                    container = PendingEvents(
-                        records=records,
-                        raw_transcript=final_text,
-                        summary_text=f"AI voice event by {sender_id}",
-                    )
-                    staged_ids = container.stage_all_events(
-                        conn=conn,
-                        audio_path=stored_path,
-                        sender_id=sender_id,
-                    )
-
-            elapsed = time.time() - start_time
-            return HarnessResult(
-                success=True,
-                reply_text=final_text,
-                raw_transcript=final_text,
-                records_created=records,
-                events_staged=len(staged_ids),
-                event_ids=staged_ids,
-                model_used=model_used,
-                total_steps=steps,
-                execution_time_seconds=round(elapsed, 3),
-                history=contents,
+            # Step 2: Agent 2 (Content Reasoning & Action Execution with Hierarchical Memory)
+            result = self.process_text(
+                text_query=raw_transcript,
+                sender_id=sender_id,
+                db_path=db_path,
+                auto_stage=auto_stage,
+                conversation_history=conversation_history,
+                memory=memory,
+                user_id=uid,
+                full_name=full_name,
+                username=username,
+                memory_manager=mgr,
+                audio_path_hint=stored_audio_path,
             )
+            result.raw_transcript = raw_transcript
+            result.execution_time_seconds = round(time.time() - start_time, 3)
+            return result
         except Exception as exc:
             elapsed = time.time() - start_time
-            logger.error(f"Voice processing failed: {exc}", exc_info=True)
+            logger.error(f"Two-agent voice processing failed: {exc}", exc_info=True)
             return HarnessResult(
                 success=False,
                 reply_text=f"Xin lỗi, hệ thống gặp lỗi khi xử lý giọng nói: {exc}",
                 execution_time_seconds=round(elapsed, 3),
                 error=str(exc),
+                memory=memory or {"draft_records": []},
+                user_id=uid,
             )
 
     def process_text(
@@ -423,39 +496,81 @@ class GenAIHarness:
         db_path: Optional[Union[str, Path]] = None,
         auto_stage: bool = True,
         conversation_history: Optional[List[Any]] = None,
+        memory: Optional[Dict[str, Any]] = None,
+        user_id: Optional[Union[str, int]] = None,
+        full_name: str = "",
+        username: Optional[str] = None,
+        memory_manager: Optional[HierarchicalMemoryManager] = None,
+        audio_path_hint: Optional[str] = None,
     ) -> HarnessResult:
-        """End-to-end text processing for farmer Q&A and ad-hoc task assignment."""
+        """Agent 2: Content reasoning and action execution with working DraftMemory."""
         start_time = time.time()
-        try:
+        uid = str(user_id) if user_id is not None else sender_id
+        mgr = memory_manager
+
+        if mgr is not None:
+            user_session = mgr.get_user_session(uid, full_name, username)
+            mgr.record_user_turn(uid, text_query, full_name, username)
+            mem = user_session.draft_memory
+            query_prompt = mgr.build_agent2_context(uid, text_query)
+            contents = list(user_session.history)
+        else:
+            mem = memory if memory is not None else {"draft_records": []}
+            draft_summary = format_draft_summary(mem)
+            query_prompt = f"{draft_summary}\n\nKHẨU LỆNH MỚI TỪ NÔNG DÂN:\n\"{text_query}\"" if draft_summary else text_query
             contents = list(conversation_history) if conversation_history else []
-            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=text_query)]))
-            final_text, records, model_used, steps = self.execute_agentic_loop(contents)
+
+        set_active_draft_memory(mem)
+        try:
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=query_prompt)]))
+            final_text, loop_records, model_used, steps = self.execute_agentic_loop(contents)
+
+            # Parse clarification needed
+            clarification_needed, clarification_items = parse_clarification_from_reply(final_text)
+
+            if mgr is not None:
+                mgr.record_ai_turn(uid, final_text, clarification_needed, clarification_items)
+                user_session.history = contents
+
+            # Consolidate all active records in draft memory
+            all_records = to_base_records(mem)
+            if not all_records and loop_records:
+                all_records = loop_records
+
             staged_ids: List[int] = []
-            if auto_stage and records:
+            # Auto-stage only when information is complete (no clarification needed)
+            if auto_stage and all_records and not clarification_needed:
                 target_db = Path(db_path) if db_path else get_db_path()
                 with get_db(target_db) as conn:
                     container = PendingEvents(
-                        records=records,
+                        records=all_records,
                         raw_transcript=text_query,
-                        summary_text=f"Text instruction by {sender_id}",
+                        summary_text=f"AI event by {full_name or uid}",
                     )
                     staged_ids = container.stage_all_events(
                         conn=conn,
-                        sender_id=sender_id,
+                        audio_path=audio_path_hint,
+                        sender_id=uid,
                     )
+                if mgr is not None:
+                    user_session.reset_draft()
 
             elapsed = time.time() - start_time
             return HarnessResult(
                 success=True,
                 reply_text=final_text,
                 raw_transcript=text_query,
-                records_created=records,
+                records_created=all_records,
                 events_staged=len(staged_ids),
                 event_ids=staged_ids,
                 model_used=model_used,
                 total_steps=steps,
                 execution_time_seconds=round(elapsed, 3),
                 history=contents,
+                memory=mem,
+                user_id=uid,
+                clarification_needed=clarification_needed,
+                clarification_items=clarification_items,
             )
         except Exception as exc:
             elapsed = time.time() - start_time
@@ -464,7 +579,47 @@ class GenAIHarness:
                 reply_text=f"Xin lỗi, hệ thống gặp lỗi: {exc}",
                 execution_time_seconds=round(elapsed, 3),
                 error=str(exc),
+                memory=mem,
+                user_id=uid,
             )
+
+    def submit_user_draft(
+        self,
+        user_id: Union[str, int],
+        memory_manager: Optional[HierarchicalMemoryManager] = None,
+        db_path: Optional[Union[str, Path]] = None,
+        audio_path: Optional[str] = None,
+        reason: str = "Manual submission by user",
+    ) -> Tuple[List[int], Optional[str]]:
+        """Stages working draft records of a user into pending_events immediately."""
+        mgr = memory_manager or get_hierarchical_memory_manager()
+        return mgr.submit_user_draft(
+            user_id=user_id,
+            db_path=db_path,
+            audio_path=audio_path,
+            reason=reason,
+        )
+
+    def check_and_trigger_watchdog(
+        self,
+        memory_manager: Optional[HierarchicalMemoryManager] = None,
+        db_path: Optional[Union[str, Path]] = None,
+    ) -> List[Tuple[UserSessionMemory, List[int]]]:
+        """Scans users waiting for clarification. If 60s timeout elapsed, auto-submits their draft records."""
+        mgr = memory_manager or get_hierarchical_memory_manager()
+        expired = mgr.get_timed_out_users()
+        auto_submitted = []
+
+        for session in expired:
+            staged_ids, err = mgr.submit_user_draft(
+                user_id=session.user_id,
+                db_path=db_path,
+                reason="Tự động nạp sau 60 giây hết hạn chờ bổ sung",
+            )
+            if staged_ids:
+                auto_submitted.append((session, staged_ids))
+
+        return auto_submitted
 
 
 # Global singleton access

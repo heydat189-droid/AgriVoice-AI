@@ -12,6 +12,7 @@ Supports:
 
 from __future__ import annotations
 
+from datetime import datetime
 import sqlite3
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
